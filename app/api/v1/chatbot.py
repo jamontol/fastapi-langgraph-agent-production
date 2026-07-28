@@ -1,36 +1,18 @@
-"""Chatbot API endpoints for handling chat interactions.
-
-This module provides endpoints for chat interactions, including regular chat,
-streaming chat, message history management, and chat history clearing.
-"""
-
 import json
-
-from fastapi import (
-    APIRouter,
-    Depends,
-    HTTPException,
-    Request,
-)
+import asyncio
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.v1.auth import get_current_session
 from app.core.config import settings
-from app.core.langgraph.graph import LangGraphAgent
 from app.core.limiter import limiter
 from app.core.logging import logger
-from app.core.metrics import llm_stream_duration_seconds
+from app.services.stream import valkey_client, enqueue_agent_task
 from app.models.session import Session
-from app.schemas.chat import (
-    ChatRequest,
-    ChatResponse,
-    StreamResponse,
-)
+from app.schemas.chat import ChatRequest, ChatResponse, StreamResponse
 from app.services.session_naming import maybe_name_session
 
 router = APIRouter()
-agent = LangGraphAgent()
-
 
 @router.post("/chat", response_model=ChatResponse)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["chat"][0])
@@ -39,19 +21,6 @@ async def chat(
     chat_request: ChatRequest,
     session: Session = Depends(get_current_session),
 ):
-    """Process a chat request using LangGraph.
-
-    Args:
-        request: The FastAPI request object for rate limiting.
-        chat_request: The chat request containing messages.
-        session: The current session from the auth token.
-
-    Returns:
-        ChatResponse: The processed chat response.
-
-    Raises:
-        HTTPException: If there's an error processing the request.
-    """
     try:
         logger.info(
             "chat_request_received",
@@ -62,13 +31,33 @@ async def chat(
         if settings.SESSION_NAMING_ENABLED:
             maybe_name_session(session.id, session.name, chat_request.messages)
 
-        result = await agent.get_response(
-            chat_request.messages, session.id, user_id=str(session.user_id), username=session.username
-        )
+        # 1. Prepare payload for the stream
+        payload = {
+            "session_id": session.id,
+            "user_id": str(session.user_id),
+            "username": session.username,
+            "messages": [m.model_dump(mode="json") for m in chat_request.messages],
+            "stream": False,
+        }
 
-        logger.info("chat_request_processed", session_id=session.id)
+        # 2. Enqueue task in Valkey Stream
+        task_id = await enqueue_agent_task(payload)
+        
+        # 3. Wait for final result via Pub/Sub channel
+        pubsub = valkey_client.pubsub()
+        channel_name = f"task_result:{task_id}"
+        await pubsub.subscribe(channel_name)
 
-        return ChatResponse(messages=result)
+        try:
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    data = json.loads(message["data"])
+                    if "error" in data:
+                        raise HTTPException(status_code=500, detail=data["error"])
+                    return ChatResponse(messages=data["messages"])
+        finally:
+            await pubsub.unsubscribe(channel_name)
+
     except Exception as e:
         logger.exception("chat_request_failed", session_id=session.id, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -81,19 +70,6 @@ async def chat_stream(
     chat_request: ChatRequest,
     session: Session = Depends(get_current_session),
 ):
-    """Process a chat request using LangGraph with streaming response.
-
-    Args:
-        request: The FastAPI request object for rate limiting.
-        chat_request: The chat request containing messages.
-        session: The current session from the auth token.
-
-    Returns:
-        StreamingResponse: A streaming response of the chat completion.
-
-    Raises:
-        HTTPException: If there's an error processing the request.
-    """
     try:
         logger.info(
             "stream_chat_request_received",
@@ -104,35 +80,45 @@ async def chat_stream(
         if settings.SESSION_NAMING_ENABLED:
             maybe_name_session(session.id, session.name, chat_request.messages)
 
+        # 1. Prepare task payload
+        payload = {
+            "session_id": session.id,
+            "user_id": str(session.user_id),
+            "username": session.username,
+            "messages": [m.model_dump(mode="json") for m in chat_request.messages],
+            "stream": True,
+        }
+
+        # 2. Enqueue to Valkey Stream
+        task_id = await enqueue_agent_task(payload)
+
         async def event_generator():
-            """Generate streaming events.
+            pubsub = valkey_client.pubsub()
+            channel_name = f"task_stream:{task_id}"
+            await pubsub.subscribe(channel_name)
 
-            Yields:
-                str: Server-sent events in JSON format.
-
-            Raises:
-                Exception: If there's an error during streaming.
-            """
             try:
-                with llm_stream_duration_seconds.labels(model=agent.llm_service.get_llm().get_name()).time():
-                    async for chunk in agent.get_stream_response(
-                        chat_request.messages, session.id, user_id=str(session.user_id), username=session.username
-                    ):
-                        response = StreamResponse(content=chunk, done=False)
+                async for message in pubsub.listen():
+                    if message["type"] == "message":
+                        data = json.loads(message["data"])
+                        
+                        # Handle errors
+                        if "error" in data:
+                            err_resp = StreamResponse(content=data["error"], done=True)
+                            yield f"data: {json.dumps(err_resp.model_dump(mode='json'))}\n\n"
+                            break
+
+                        # Check for completion flag
+                        if data.get("done", False):
+                            final_response = StreamResponse(content="", done=True)
+                            yield f"data: {json.dumps(final_response.model_dump(mode='json'))}\n\n"
+                            break
+
+                        # Stream content chunk
+                        response = StreamResponse(content=data.get("content", ""), done=False)
                         yield f"data: {json.dumps(response.model_dump(mode='json'))}\n\n"
-
-                # Send final message indicating completion
-                final_response = StreamResponse(content="", done=True)
-                yield f"data: {json.dumps(final_response.model_dump(mode='json'))}\n\n"
-
-            except Exception as e:
-                logger.exception(
-                    "stream_chat_request_failed",
-                    session_id=session.id,
-                    error=str(e),
-                )
-                error_response = StreamResponse(content=str(e), done=True)
-                yield f"data: {json.dumps(error_response.model_dump(mode='json'))}\n\n"
+            finally:
+                await pubsub.unsubscribe(channel_name)
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -142,53 +128,4 @@ async def chat_stream(
             session_id=session.id,
             error=str(e),
         )
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/messages", response_model=ChatResponse)
-@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])
-async def get_session_messages(
-    request: Request,
-    session: Session = Depends(get_current_session),
-):
-    """Get all messages for a session.
-
-    Args:
-        request: The FastAPI request object for rate limiting.
-        session: The current session from the auth token.
-
-    Returns:
-        ChatResponse: All messages in the session.
-
-    Raises:
-        HTTPException: If there's an error retrieving the messages.
-    """
-    try:
-        messages = await agent.get_chat_history(session.id)
-        return ChatResponse(messages=messages)
-    except Exception as e:
-        logger.exception("get_messages_failed", session_id=session.id, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.delete("/messages")
-@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])
-async def clear_chat_history(
-    request: Request,
-    session: Session = Depends(get_current_session),
-):
-    """Clear all messages for a session.
-
-    Args:
-        request: The FastAPI request object for rate limiting.
-        session: The current session from the auth token.
-
-    Returns:
-        dict: A message indicating the chat history was cleared.
-    """
-    try:
-        await agent.clear_chat_history(session.id)
-        return {"message": "Chat history cleared successfully"}
-    except Exception as e:
-        logger.exception("clear_chat_history_failed", session_id=session.id, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
