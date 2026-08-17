@@ -30,6 +30,7 @@ from app.core.middleware import (
     ProfilingMiddleware,
 )
 from app.core.observability import langfuse_init
+from app.core.valkey import init_valkey_stream
 from app.services.database import database_service
 from app.services.memory import memory_service
 
@@ -53,6 +54,12 @@ async def lifespan(app: FastAPI):
         await cache_service.initialize()
     except Exception as e:
         logger.exception("cache_initialization_failed", error=str(e))
+
+    # Ensure the task stream consumer group exists for the async worker bus
+    try:
+        await init_valkey_stream()
+    except Exception as e:
+        logger.exception("valkey_stream_init_failed", error=str(e))
 
     # Pre-warm the LangGraph agent: create graph + connection pool at startup
     # to avoid cold-start latency on the first request
